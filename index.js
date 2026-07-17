@@ -68,7 +68,8 @@ app.post("/webhook", async (req, res) => {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          api_access_token: IPLUG_BOT_TOKEN,
+          // Com traços, não underline: o proxy do iPlug descarta headers com "_"
+          "api-access-token": IPLUG_BOT_TOKEN,
         },
         body: JSON.stringify({ content: resposta, message_type: "outgoing" }),
       }
