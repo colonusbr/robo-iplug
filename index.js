@@ -44,44 +44,69 @@ const headersIplug = {
   "api-access-token": IPLUG_BOT_TOKEN,
 };
 
-// Busca as últimas mensagens da conversa no iPlug pra dar memória ao robô.
-// Se falhar por qualquer motivo, o robô segue só com a mensagem atual.
-async function buscarHistorico(conversaId, textoAtual) {
-  const fallback = [{ role: "user", content: textoAtual }];
-  try {
-    const r = await fetch(
-      `${IPLUG_BASE_URL}/api/v1/accounts/${IPLUG_ACCOUNT_ID}/conversations/${conversaId}/messages`,
-      { headers: headersIplug }
-    );
-    if (!r.ok) return fallback;
-    const dados = await r.json();
-    const lista = Array.isArray(dados?.payload) ? dados.payload : [];
+const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    const historico = [];
-    for (const m of lista) {
-      if (m.private) continue; // nota interna do time, cliente não vê
-      const texto = (m.content || "").trim();
-      if (!texto) continue;
-      // message_type: 0 = cliente (incoming), 1 = loja (outgoing)
-      const tipo = m.message_type;
-      if (tipo === 0 || tipo === "incoming") {
-        historico.push({ role: "user", content: texto });
-      } else if (tipo === 1 || tipo === "outgoing") {
-        historico.push({ role: "assistant", content: texto });
-      }
-    }
+// Extrai o texto de uma mensagem: o texto escrito ou, se for áudio,
+// a transcrição que o próprio iPlug gera (campo transcribed_text do anexo).
+function textoDaMensagem(m) {
+  const escrito = (m.content || "").trim();
+  if (escrito) return escrito;
+  const transcricao = (m.attachments || [])
+    .map((a) => (a.transcribed_text || "").trim())
+    .filter(Boolean)
+    .join(" ");
+  return transcricao;
+}
 
-    // Mantém só as últimas 20 mensagens pra conversa não ficar gigante.
-    let msgs = historico.slice(-20);
-    // A conversa precisa começar com mensagem do cliente.
-    while (msgs.length && msgs[0].role !== "user") msgs.shift();
-    // E terminar com a mensagem atual do cliente.
-    if (!msgs.length || msgs[msgs.length - 1].role !== "user") {
-      msgs.push({ role: "user", content: textoAtual });
+// Busca as mensagens da conversa no iPlug (memória + transcrições de áudio).
+async function buscarMensagensDaConversa(conversaId) {
+  const r = await fetch(
+    `${IPLUG_BASE_URL}/api/v1/accounts/${IPLUG_ACCOUNT_ID}/conversations/${conversaId}/messages`,
+    { headers: headersIplug }
+  );
+  if (!r.ok) return null;
+  const dados = await r.json();
+  return Array.isArray(dados?.payload) ? dados.payload : [];
+}
+
+// Monta o histórico no formato que o Claude entende.
+function montarHistorico(lista, textoAtual) {
+  const historico = [];
+  for (const m of lista) {
+    if (m.private) continue; // nota interna do time, cliente não vê
+    const texto = textoDaMensagem(m);
+    if (!texto) continue;
+    // message_type: 0 = cliente (incoming), 1 = loja (outgoing)
+    const tipo = m.message_type;
+    if (tipo === 0 || tipo === "incoming") {
+      historico.push({ role: "user", content: texto });
+    } else if (tipo === 1 || tipo === "outgoing") {
+      historico.push({ role: "assistant", content: texto });
     }
-    return msgs.length ? msgs : fallback;
-  } catch {
-    return fallback;
+  }
+  // Mantém só as últimas 20 mensagens pra conversa não ficar gigante.
+  let msgs = historico.slice(-20);
+  // A conversa precisa começar com mensagem do cliente.
+  while (msgs.length && msgs[0].role !== "user") msgs.shift();
+  // E terminar com mensagem do cliente.
+  if (!msgs.length || msgs[msgs.length - 1].role !== "user") {
+    if (textoAtual) msgs.push({ role: "user", content: textoAtual });
+  }
+  return msgs;
+}
+
+// Manda uma resposta pra conversa no iPlug.
+async function responderNoIplug(conversaId, resposta) {
+  const r = await fetch(
+    `${IPLUG_BASE_URL}/api/v1/accounts/${IPLUG_ACCOUNT_ID}/conversations/${conversaId}/messages`,
+    {
+      method: "POST",
+      headers: headersIplug,
+      body: JSON.stringify({ content: resposta, message_type: "outgoing" }),
+    }
+  );
+  if (!r.ok) {
+    console.error("Falha ao responder no iPlug:", r.status, await r.text());
   }
 }
 
@@ -105,19 +130,55 @@ app.post("/webhook", async (req, res) => {
     if (body.message_type !== "incoming") return;
     if (body.private) return;
 
-    const texto = (body.content || "").trim();
+    let texto = (body.content || "").trim();
+    const temAnexo = Array.isArray(body.attachments) && body.attachments.length > 0;
     // No webhook do Chatwoot o id da conversa vem em conversation.id (= o número
     // que aparece na tela). Se a resposta falhar, tente conversation.display_id.
     const conversaId = body.conversation?.id ?? body.conversation?.display_id;
-    if (!texto || !conversaId) return;
+    if (!conversaId) return;
+    if (!texto && !temAnexo) return; // nada pra entender
 
-    // 3) Monta a conversa com memória e pergunta pro Claude.
-    const mensagens = await buscarHistorico(conversaId, texto);
+    // 3) Cliente mandou áudio sem texto: espera a transcrição do iPlug ficar
+    //    pronta (ela é gerada alguns segundos depois da mensagem chegar).
+    let lista = null;
+    if (!texto) {
+      for (let tentativa = 0; tentativa < 4; tentativa++) {
+        await esperar(4000);
+        lista = await buscarMensagensDaConversa(conversaId);
+        if (!lista) continue;
+        // Procura a última mensagem do cliente e tenta extrair o texto dela.
+        const doCliente = lista.filter(
+          (m) => (m.message_type === 0 || m.message_type === "incoming") && !m.private
+        );
+        const ultima = doCliente[doCliente.length - 1];
+        if (ultima) {
+          const t = textoDaMensagem(ultima);
+          if (t) {
+            texto = t;
+            break;
+          }
+        }
+      }
+      // Transcrição não veio: pede com educação pra escrever e para por aqui.
+      if (!texto) {
+        await responderNoIplug(
+          conversaId,
+          "Não consegui ouvir seu áudio por aqui. Consegue me mandar por escrito, por favor?"
+        );
+        return;
+      }
+    }
+
+    // 4) Monta a conversa com memória e pergunta pro Claude.
+    if (!lista) lista = await buscarMensagensDaConversa(conversaId);
+    const mensagens = lista
+      ? montarHistorico(lista, texto)
+      : [{ role: "user", content: texto }];
     const resp = await anthropic.messages.create({
       model: ANTHROPIC_MODEL,
       max_tokens: 600,
       system: PERSONALIDADE,
-      messages: mensagens,
+      messages: mensagens.length ? mensagens : [{ role: "user", content: texto }],
     });
     const resposta =
       resp.content
@@ -126,18 +187,8 @@ app.post("/webhook", async (req, res) => {
         .join("\n")
         .trim() || "Desculpe, não consegui responder agora.";
 
-    // 4) Manda a resposta de volta pra conversa no iPlug.
-    const r = await fetch(
-      `${IPLUG_BASE_URL}/api/v1/accounts/${IPLUG_ACCOUNT_ID}/conversations/${conversaId}/messages`,
-      {
-        method: "POST",
-        headers: headersIplug,
-        body: JSON.stringify({ content: resposta, message_type: "outgoing" }),
-      }
-    );
-    if (!r.ok) {
-      console.error("Falha ao responder no iPlug:", r.status, await r.text());
-    }
+    // 5) Manda a resposta de volta pra conversa no iPlug.
+    await responderNoIplug(conversaId, resposta);
   } catch (e) {
     console.error("Erro no webhook:", e);
   }
