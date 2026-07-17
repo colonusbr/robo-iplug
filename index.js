@@ -136,6 +136,25 @@ async function executarFerramenta(nome, input) {
   }
 }
 
+// Garante o padrão de escrita da Colonus mesmo se o modelo escorregar: sem
+// asterisco/negrito/markdown, sem travessão (vira vírgula), sem bullets.
+function limparFormatacao(t) {
+  return (t || "")
+    .replace(/^\s*#{1,6}\s*/gm, "") // títulos markdown
+    .replace(/^\s*[-*•]\s+/gm, "") // bullets no início de linha
+    .replace(/\*\*/g, "")
+    .replace(/\*/g, "") // negrito/itálico
+    .replace(/`+/g, "") // crase/código
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/_/g, "") // sublinhado/underscore
+    .replace(/ *[—–] */g, ", ") // travessão (em/en dash) vira vírgula
+    .replace(/ - /g, ", ") // hífen usado como travessão vira vírgula
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 // Conversa com o Claude com tool use: enquanto ele pedir ferramenta, executa e
 // devolve o resultado, até ele produzir a resposta final em texto.
 async function conversarComClaude(mensagens) {
@@ -166,14 +185,14 @@ async function conversarComClaude(mensagens) {
       continue; // pergunta de novo, agora com os dados
     }
 
-    // Resposta final em texto.
-    return (
+    // Resposta final em texto (já limpa do formato proibido).
+    const bruto =
       resp.content
         .filter((b) => b.type === "text")
         .map((b) => b.text)
         .join("\n")
-        .trim() || "Desculpe, não consegui responder agora."
-    );
+        .trim() || "Desculpe, não consegui responder agora.";
+    return limparFormatacao(bruto);
   }
   return "Desculpe, tive um problema pra montar sua resposta. Pode repetir?";
 }
