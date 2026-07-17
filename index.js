@@ -2,6 +2,9 @@
 // Serviço isolado — NÃO tem vínculo com nenhum outro sistema. Recebe o webhook
 // do iPlug quando o cliente manda mensagem, pergunta pro Claude e responde de
 // volta pela API do iPlug.
+//
+// Agora com TOOL USE: o Claude pode consultar a API do colonus-sales durante a
+// conversa (preços, troca e parcelamento) e responder com valores reais.
 import express from "express";
 import fs from "fs";
 import Anthropic from "@anthropic-ai/sdk";
@@ -14,6 +17,9 @@ const {
   IPLUG_BOT_TOKEN,
   WEBHOOK_SECRET,
   SYSTEM_PROMPT,
+  // API de preços do colonus-sales (só-leitura):
+  COLONUS_API_BASE = "https://vendas.colonus.com.br/api/robo",
+  COLONUS_API_KEY,
   PORT = 3000,
 } = process.env;
 
@@ -45,6 +51,132 @@ const headersIplug = {
 };
 
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ──────────────────────────────────────────────────────────────────────────
+// FERRAMENTAS (tool use): ligam o Claude à API de preços do colonus-sales.
+// ──────────────────────────────────────────────────────────────────────────
+const COLONUS_BASE = (COLONUS_API_BASE || "").replace(/\/$/, "");
+
+const TOOLS = [
+  {
+    name: "consultar_preco",
+    description:
+      "Consulta preços de venda de aparelhos na Colonus (novo, seminovo ou encomenda). " +
+      "Devolve preço à vista, à vista com desconto e a tabela de parcelas (cheio/intermediário/real). " +
+      "Use quando o cliente perguntar preço ou o valor de um aparelho.",
+    input_schema: {
+      type: "object",
+      properties: {
+        busca: { type: "string", description: "Ex.: 'iphone 15 pro max' ou 'apple watch 9'." },
+        condicao: {
+          type: "string",
+          enum: ["novo", "seminovo", "encomenda"],
+          description: "Filtra a condição. Opcional.",
+        },
+      },
+      required: ["busca"],
+    },
+  },
+  {
+    name: "avaliar_troca",
+    description:
+      "Estima quanto o aparelho usado do cliente vale como entrada (troca). " +
+      "Colete antes: modelo, armazenamento e saúde da bateria. É estimativa, sujeita à avaliação na loja.",
+    input_schema: {
+      type: "object",
+      properties: {
+        modelo: { type: "string", description: "Ex.: 'iphone 11 pro max'." },
+        armazenamento: { type: "string", description: "Ex.: '128' ou '128GB'. Opcional." },
+        bateria: { type: "number", description: "Saúde da bateria em %, ex.: 82. Opcional." },
+      },
+      required: ["modelo"],
+    },
+  },
+  {
+    name: "calcular_parcelas",
+    description:
+      "Calcula a tabela de parcelas (cheio/intermediário/real) para um valor qualquer — " +
+      "por exemplo, a diferença depois de descontar a troca do preço do aparelho.",
+    input_schema: {
+      type: "object",
+      properties: {
+        valor: { type: "number", description: "Valor a parcelar, ex.: 7450." },
+      },
+      required: ["valor"],
+    },
+  },
+];
+
+async function getColonus(caminho, params) {
+  const url = new URL(COLONUS_BASE + caminho);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
+  }
+  const res = await fetch(url, { headers: { "x-api-key": COLONUS_API_KEY || "" } });
+  const json = await res.json().catch(() => ({ erro: "resposta inválida" }));
+  if (!res.ok) return { erro: json?.erro || `HTTP ${res.status}` };
+  return json;
+}
+
+async function executarFerramenta(nome, input) {
+  try {
+    if (nome === "consultar_preco")
+      return await getColonus("/produtos", { busca: input.busca, condicao: input.condicao });
+    if (nome === "avaliar_troca")
+      return await getColonus("/troca", {
+        modelo: input.modelo,
+        armazenamento: input.armazenamento,
+        bateria: input.bateria,
+      });
+    if (nome === "calcular_parcelas")
+      return await getColonus("/parcelamento", { valor: input.valor });
+    return { erro: "ferramenta desconhecida: " + nome };
+  } catch (e) {
+    return { erro: String(e?.message || e) };
+  }
+}
+
+// Conversa com o Claude com tool use: enquanto ele pedir ferramenta, executa e
+// devolve o resultado, até ele produzir a resposta final em texto.
+async function conversarComClaude(mensagens) {
+  const messages = [...mensagens];
+  for (let volta = 0; volta < 5; volta++) {
+    const resp = await anthropic.messages.create({
+      model: ANTHROPIC_MODEL,
+      max_tokens: 600,
+      system: PERSONALIDADE,
+      tools: TOOLS,
+      messages,
+    });
+
+    if (resp.stop_reason === "tool_use") {
+      const resultados = [];
+      for (const bloco of resp.content) {
+        if (bloco.type === "tool_use") {
+          const dados = await executarFerramenta(bloco.name, bloco.input);
+          resultados.push({
+            type: "tool_result",
+            tool_use_id: bloco.id,
+            content: JSON.stringify(dados),
+          });
+        }
+      }
+      messages.push({ role: "assistant", content: resp.content });
+      messages.push({ role: "user", content: resultados });
+      continue; // pergunta de novo, agora com os dados
+    }
+
+    // Resposta final em texto.
+    return (
+      resp.content
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim() || "Desculpe, não consegui responder agora."
+    );
+  }
+  return "Desculpe, tive um problema pra montar sua resposta. Pode repetir?";
+}
 
 // Extrai o texto de uma mensagem: o texto escrito ou, se for áudio,
 // a transcrição que o próprio iPlug gera (campo transcribed_text do anexo).
@@ -169,23 +301,14 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // 4) Monta a conversa com memória e pergunta pro Claude.
+    // 4) Monta a conversa com memória e pergunta pro Claude (com tool use).
     if (!lista) lista = await buscarMensagensDaConversa(conversaId);
     const mensagens = lista
       ? montarHistorico(lista, texto)
       : [{ role: "user", content: texto }];
-    const resp = await anthropic.messages.create({
-      model: ANTHROPIC_MODEL,
-      max_tokens: 600,
-      system: PERSONALIDADE,
-      messages: mensagens.length ? mensagens : [{ role: "user", content: texto }],
-    });
-    const resposta =
-      resp.content
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
-        .join("\n")
-        .trim() || "Desculpe, não consegui responder agora.";
+    const resposta = await conversarComClaude(
+      mensagens.length ? mensagens : [{ role: "user", content: texto }]
+    );
 
     // 5) Manda a resposta de volta pra conversa no iPlug.
     await responderNoIplug(conversaId, resposta);
