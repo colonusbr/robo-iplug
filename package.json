@@ -1,0 +1,17 @@
+{
+  "name": "robo-iplug",
+  "version": "1.0.0",
+  "description": "Ponte entre o iPlug (Chatwoot) e a Anthropic (Claude) — robô de atendimento.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.105.0",
+    "express": "^4.19.2"
+  }
+}
